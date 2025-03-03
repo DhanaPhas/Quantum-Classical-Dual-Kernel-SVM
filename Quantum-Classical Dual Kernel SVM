@@ -1,0 +1,388 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+
+# Sklearn imports for SVM and preprocessing
+from sklearn.svm import SVC
+from sklearn.metrics import classification_report, accuracy_score
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.decomposition import PCA
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.metrics.pairwise import rbf_kernel, polynomial_kernel, linear_kernel
+
+# Qiskit imports for quantum SVC and quantum kernel
+from qiskit.circuit.library import ZZFeatureMap
+from qiskit_machine_learning.kernels import FidelityStatevectorKernel
+
+###############################################
+# Custom Estimator: Quantum Kernel SVC
+###############################################
+class QuantumKernelSVC(BaseEstimator, ClassifierMixin):
+    def __init__(self, C=1.0, entanglement='linear'):
+        """
+        Quantum Kernel SVM using FidelityStatevectorKernel.
+        
+        Parameters:
+        - C: SVM regularization parameter.
+        - entanglement: Type of entanglement ('linear', 'circular', 'full').
+        """
+        self.C = C
+        self.entanglement = entanglement
+        self.reps = 2  # Fixed reps for simplicity
+    
+    def fit(self, X, y):
+        """Create the quantum feature map and compute the kernel matrix."""
+        feature_dim = X.shape[1]
+        feature_map = ZZFeatureMap(feature_dimension=feature_dim, reps=self.reps, entanglement=self.entanglement)
+        self.quantum_kernel = FidelityStatevectorKernel(feature_map=feature_map)
+        
+        # Compute quantum kernel for training data.
+        K_train = self.quantum_kernel.evaluate(X, X)
+        
+        # Train SVM with precomputed kernel.
+        self.svc_ = SVC(kernel='precomputed', C=self.C)
+        self.svc_.fit(K_train, y)
+        
+        # Save training data.
+        self.X_train_ = X
+        return self
+    
+    def predict(self, X):
+        """Predict class labels using quantum kernel."""
+        K_test = self.quantum_kernel.evaluate(X, self.X_train_)
+        return self.svc_.predict(K_test)
+
+###############################################
+# Custom Estimator: Dual Kernel SVC
+###############################################
+class DualKernelSVC(BaseEstimator, ClassifierMixin):
+    def __init__(self, C=1.0, alpha=0.5, gamma=0.1, kernel_type='rbf', quantum_entanglement='linear'):
+        """
+        DualKernelSVC combines a quantum kernel with a classical kernel.
+        
+        Parameters:
+        - C: SVM regularization parameter.
+        - alpha: Weight for the quantum kernel (in [0,1]); (1 - alpha) is the weight for the classical kernel.
+        - gamma: Parameter for the classical kernel.
+        - kernel_type: Type of classical kernel to use ('rbf', 'poly', or 'linear').
+        - quantum_entanglement: Quantum entanglement setting ('linear', 'circular', or 'full').
+        """
+        self.C = C
+        self.alpha = alpha
+        self.gamma = gamma
+        self.kernel_type = kernel_type
+        self.quantum_entanglement = quantum_entanglement
+        self.quantum_reps = 2  # Fixed reps
+    
+    def quantum_kernel_function(self, X, Y):
+        """Compute the quantum kernel matrix using FidelityStatevectorKernel."""
+        return self.quantum_kernel.evaluate(X, Y)
+    
+    def classical_kernel_function(self, X, Y):
+        """Compute the classical kernel matrix based on the selected kernel type."""
+        if self.kernel_type == 'rbf':
+            return rbf_kernel(X, Y, gamma=self.gamma)
+        elif self.kernel_type == 'poly':
+            # Using fixed degree=3 and coef0=1 for demonstration.
+            return polynomial_kernel(X, Y, degree=3, gamma=self.gamma, coef0=1)
+        else:  # linear
+            return linear_kernel(X, Y)
+    
+    def compute_dual_kernel(self, X, Y):
+        """Compute the dual kernel as a weighted sum of quantum and classical kernels."""
+        Kq = self.quantum_kernel_function(X, Y)
+        Kc = self.classical_kernel_function(X, Y)
+        return self.alpha * Kq + (1 - self.alpha) * Kc
+    
+    def fit(self, X, y):
+        """Construct the quantum feature map, compute the quantum kernel, then fit SVC using the dual kernel."""
+        feature_dim = X.shape[1]
+        feature_map = ZZFeatureMap(feature_dimension=feature_dim, reps=self.quantum_reps, entanglement=self.quantum_entanglement)
+        self.quantum_kernel = FidelityStatevectorKernel(feature_map=feature_map)
+        
+        K_train = self.compute_dual_kernel(X, X)
+        self.svc_ = SVC(kernel='precomputed', C=self.C)
+        self.svc_.fit(K_train, y)
+        
+        self.X_train_ = X
+        return self
+    
+    def predict(self, X):
+        """Compute dual kernel between test and training data and predict labels."""
+        K_test = self.compute_dual_kernel(X, self.X_train_)
+        return self.svc_.predict(K_test)
+
+###############################################
+# Combined Experimental Pipeline
+###############################################
+
+# Define directories for different noise levels of PQD data.
+directories = [
+    r"C:\Users\DhanaP\Desktop\Data_for_QSVM1\SNR_Noiseless",
+    r"C:\Users\DhanaP\Desktop\Data_for_QSVM1\SNR_20dB",
+    r"C:\Users\DhanaP\Desktop\Data_for_QSVM1\SNR_30dB",
+    r"C:\Users\DhanaP\Desktop\Data_for_QSVM1\SNR_40dB",
+    r"C:\Users\DhanaP\Desktop\Data_for_QSVM1\SNR_50dB"
+]
+
+# Feature columns.
+column_names = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8"]
+
+# Use an 75:25 train:test split.
+test_size = 0.25
+
+# Container for overall results.
+overall_results = []
+
+# Define different entanglement types for quantum kernel testing.
+entanglement_patterns = ['linear', 'circular', 'full']
+
+###############################################
+# Define Parameter Grids for Classical SVCs
+###############################################
+param_grid_poly = {
+    'C': [0.1, 1, 10, 100],
+    'kernel': ['poly'],
+    'gamma': [0.001, 0.01, 0.1, 1.0],
+    'degree': [2, 3, 4, 5],
+    'coef0': [0, 1]
+}
+param_grid_rbf = {
+    'C': [0.1, 1, 10, 100],
+    'kernel': ['rbf'],
+    'gamma': [0.001, 0.01, 0.1, 1.0]
+}
+param_grid_linear = {
+    'C': [0.1, 1, 10, 100],
+    'kernel': ['linear']
+}
+
+###############################################
+# Process Each Dataset Directory
+###############################################
+for data_path in directories:
+    print("\n===================================================")
+    print("Processing data from:", data_path)
+    
+    # STEP 1: Load CSV files and assign labels.
+    data_list = []
+    if not os.path.exists(data_path):
+        print(f"Directory not found: {data_path}")
+        continue
+    all_files = [f for f in os.listdir(data_path) if f.endswith('.csv')]
+    sorted_files = sorted(all_files, key=lambda x: int(x.split('_')[0]))
+    file_paths = [os.path.join(data_path, f) for f in sorted_files]
+    
+    for file_path in file_paths[:9]:
+        df = pd.read_csv(file_path, usecols=column_names)
+        file_name = os.path.basename(file_path)
+        try:
+            label = int(file_name.split('_')[0])
+        except ValueError:
+            print(f"Could not extract number from file: {file_name}")
+            label = -1
+        df['label'] = label
+        data_list.append(df)
+    
+    if not data_list:
+        print("No data loaded from:", data_path)
+        continue
+    
+    full_data = pd.concat(data_list, ignore_index=True)
+    print("Combined data shape:", full_data.shape)
+    
+    X = full_data[column_names]
+    y = full_data['label']
+    
+    # STEP 2: Preprocess Data (Standardization -> PCA -> MinMax Scaling)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+    std_scaler = StandardScaler()
+    X_train_std = std_scaler.fit_transform(X_train)
+    X_test_std = std_scaler.transform(X_test)
+    pca = PCA(n_components=0.95)
+    X_train_pca = pca.fit_transform(X_train_std)
+    X_test_pca = pca.transform(X_test_std)
+    minmax_scaler = MinMaxScaler()
+    X_train_preprocessed = minmax_scaler.fit_transform(X_train_pca)
+    X_test_preprocessed = minmax_scaler.transform(X_test_pca)
+    
+    ###############################################
+    # Classical SVC Experiments
+    ###############################################
+    classical_results = []  # to hold results for this dataset
+    
+    # Poly Kernel Experiment
+    print("\n--- Classical SVC with Poly Kernel ---")
+    svc_poly = SVC()
+    grid_poly = GridSearchCV(svc_poly, param_grid=param_grid_poly, cv=5, scoring='accuracy')
+    start_time = time.time()
+    grid_poly.fit(X_train_preprocessed, y_train)
+    end_time = time.time()
+    best_poly = grid_poly.best_estimator_
+    y_pred_poly = best_poly.predict(X_test_preprocessed)
+    acc_poly = accuracy_score(y_test, y_pred_poly)
+    print(f"Poly Kernel Best Params: {grid_poly.best_params_}, Accuracy: {acc_poly:.4f}, Duration: {end_time - start_time:.2f}s")
+    classical_results.append({
+        "Method": "poly",
+        "Best_Params": grid_poly.best_params_,
+        "Accuracy": acc_poly
+    })
+    
+    # RBF Kernel Experiment
+    print("\n--- Classical SVC with RBF Kernel ---")
+    svc_rbf = SVC()
+    grid_rbf = GridSearchCV(svc_rbf, param_grid=param_grid_rbf, cv=5, scoring='accuracy')
+    start_time = time.time()
+    grid_rbf.fit(X_train_preprocessed, y_train)
+    end_time = time.time()
+    best_rbf = grid_rbf.best_estimator_
+    y_pred_rbf = best_rbf.predict(X_test_preprocessed)
+    acc_rbf = accuracy_score(y_test, y_pred_rbf)
+    print(f"RBF Kernel Best Params: {grid_rbf.best_params_}, Accuracy: {acc_rbf:.4f}, Duration: {end_time - start_time:.2f}s")
+    classical_results.append({
+        "Method": "rbf",
+        "Best_Params": grid_rbf.best_params_,
+        "Accuracy": acc_rbf
+    })
+    
+    # Linear Kernel Experiment
+    print("\n--- Classical SVC with Linear Kernel ---")
+    svc_linear = SVC()
+    grid_linear = GridSearchCV(svc_linear, param_grid=param_grid_linear, cv=5, scoring='accuracy')
+    start_time = time.time()
+    grid_linear.fit(X_train_preprocessed, y_train)
+    end_time = time.time()
+    best_linear = grid_linear.best_estimator_
+    y_pred_linear = best_linear.predict(X_test_preprocessed)
+    acc_linear = accuracy_score(y_test, y_pred_linear)
+    print(f"Linear Kernel Best Params: {grid_linear.best_params_}, Accuracy: {acc_linear:.4f}, Duration: {end_time - start_time:.2f}s")
+    classical_results.append({
+        "Method": "linear",
+        "Best_Params": grid_linear.best_params_,
+        "Accuracy": acc_linear
+    })
+    
+    # Print all classical results and select best.
+    print("\n--- Classical Kernel Results ---")
+    for res in classical_results:
+        print(f"Method: {res['Method']}, Best Params: {res['Best_Params']}, Accuracy: {res['Accuracy']:.4f}")
+    best_classical = max(classical_results, key=lambda x: x["Accuracy"])
+    best_kernel_type = best_classical["Method"]
+    best_params = best_classical["Best_Params"]
+    best_C = best_params["C"]
+    if best_kernel_type == "poly":
+        best_gamma = best_params.get("gamma", 0.001)
+        best_degree = best_params.get("degree", None)
+        best_coef0 = best_params.get("coef0", None)
+        print(f"\nSelected Best Classical Kernel: POLY with degree={best_degree}, coef0={best_coef0}, gamma={best_gamma}, C={best_C}")
+    elif best_kernel_type == "rbf":
+        best_gamma = best_params.get("gamma", 0.001)
+        print(f"\nSelected Best Classical Kernel: RBF with gamma={best_gamma}, C={best_C}")
+    else:
+        best_gamma = 0.001
+        print(f"\nSelected Best Classical Kernel: LINEAR with C={best_C}")
+    
+    ###############################################
+    # Quantum Kernel SVC Experiments (Varying C and Entanglement)
+    ###############################################
+    quantum_results = []
+    param_grid_quantum = {'C': [0.1, 1, 10, 100]}
+    print("\n--- Quantum Kernel SVC Experiments ---")
+    for entanglement in entanglement_patterns:
+        # Grid search on quantum SVC for current entanglement pattern.
+        qsvc = QuantumKernelSVC(entanglement=entanglement)
+        grid_qsvc = GridSearchCV(qsvc, param_grid=param_grid_quantum, cv=5, scoring='accuracy')
+        start_time = time.time()
+        grid_qsvc.fit(X_train_preprocessed, y_train)
+        end_time = time.time()
+        best_qsvc = grid_qsvc.best_estimator_
+        y_pred_qsvc = best_qsvc.predict(X_test_preprocessed)
+        acc_qsvc = accuracy_score(y_test, y_pred_qsvc)
+        print(f"Entanglement: {entanglement}, Best Params: {grid_qsvc.best_params_}, Quantum SVC Accuracy: {acc_qsvc:.4f}, Duration: {end_time - start_time:.2f}s")
+        quantum_results.append({
+            "Entanglement": entanglement,
+            "Best_Params": grid_qsvc.best_params_,
+            "Accuracy": acc_qsvc
+        })
+    for res in quantum_results:
+        print(f"Entanglement: {res['Entanglement']}, Best Params: {res['Best_Params']}, Accuracy: {res['Accuracy']:.4f}")
+    best_quantum = max(quantum_results, key=lambda x: x["Accuracy"])
+    best_entanglement = best_quantum["Entanglement"]
+    best_quantum_C = best_quantum["Best_Params"]["C"]
+    print(f"\nSelected Best Quantum Kernel: {best_entanglement} with C={best_quantum_C}")
+    
+    ###############################################
+    # Dual Kernel SVC Experiment (Varying Alpha)
+    ###############################################
+    alpha_list = [0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.00]
+    dual_results = []
+    print("\n--- Dual Kernel SVC Experiment (Varying Alpha) ---")
+    for alpha in alpha_list:
+        dual_svc = DualKernelSVC(C=best_C, alpha=alpha, gamma=best_gamma, kernel_type=best_kernel_type, quantum_entanglement=best_entanglement)
+        start_time = time.time()
+        dual_svc.fit(X_train_preprocessed, y_train)
+        end_time = time.time()
+        y_pred_dual = dual_svc.predict(X_test_preprocessed)
+        acc_dual = accuracy_score(y_test, y_pred_dual)
+        print(f"Alpha: {alpha}, Dual Kernel SVC Accuracy: {acc_dual:.4f}, Duration: {end_time - start_time:.2f}s")
+        dual_results.append({
+            "alpha": alpha,
+            "Accuracy": acc_dual
+        })
+    best_dual = max(dual_results, key=lambda x: x["Accuracy"])
+    best_alpha = best_dual["alpha"]
+    
+    # Run final dual kernel experiment with best alpha.
+    dual_svc = DualKernelSVC(C=best_C, alpha=best_alpha, gamma=best_gamma, kernel_type=best_kernel_type, quantum_entanglement=best_entanglement)
+    start_time = time.time()
+    dual_svc.fit(X_train_preprocessed, y_train)
+    end_time = time.time()
+    y_pred_dual = dual_svc.predict(X_test_preprocessed)
+    acc_dual = accuracy_score(y_test, y_pred_dual)
+    rep_dual = classification_report(y_test, y_pred_dual, output_dict=True)
+    print(f"\n--- Dual Kernel SVC Final Experiment ---")
+    print(f"Dual Kernel Best Configuration: Best Classical: {best_kernel_type.upper()} with params {best_params}, Best Quantum: {best_entanglement} with C={best_quantum_C}, Best Alpha: {best_alpha}")
+    print(f"Dual Kernel SVC Accuracy: {acc_dual:.4f}, Duration: {end_time - start_time:.2f}s")
+    
+    overall_results.append({
+        "DataPath": data_path,
+        "Best_Classical_Kernel": best_kernel_type,
+        "Best_Classical_Params": best_params,
+        "Best_Quantum_Entanglement": best_entanglement,
+        "Best_Quantum_C": best_quantum_C,
+        "Dual_Best_Alpha": best_alpha,
+        "Dual_Accuracy": acc_dual,
+        "Dual_Precision": rep_dual["macro avg"]["precision"],
+        "Dual_Recall": rep_dual["macro avg"]["recall"],
+        "Dual_F1": rep_dual["macro avg"]["f1-score"],
+        "Dual_Time": end_time - start_time
+    })
+
+# ====================================================
+# Summary: Compare Performance Across All Experiments
+# ====================================================
+print("\n\n========== Summary of Experimental Results ==========")
+results_df = pd.DataFrame(overall_results)
+print(results_df)
+
+print("\n\n=== All Experiment Results ===")
+for idx, res in results_df.iterrows():
+    print(f"DataPath: {res['DataPath']}, Best Classical: {res['Best_Classical_Params']}, "
+          f"Best Quantum: {res['Best_Quantum_Entanglement']} (C={res['Best_Quantum_C']}), Dual Best Alpha: {res['Dual_Best_Alpha']}, Dual Accuracy: {res['Dual_Accuracy']:.4f}")
+
+pivot_table = results_df.pivot_table(index=["DataPath"], 
+                                     values=["Dual_Accuracy", "Dual_Precision", "Dual_Recall", "Dual_F1", "Dual_Time"])
+print("\nPivot Table:")
+print(pivot_table)
+
+import seaborn as sns
+sns.set(style="whitegrid")
+plt.figure(figsize=(12, 6))
+sns.barplot(data=results_df, x="DataPath", y="Dual_Accuracy")
+plt.title("Dual Kernel SVC Accuracy for Different Datasets (75:25 Split)")
+plt.xlabel("Dataset")
+plt.ylabel("Dual Kernel Accuracy")
+plt.show()
